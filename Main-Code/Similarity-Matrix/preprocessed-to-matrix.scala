@@ -52,7 +52,7 @@ def calculateTFIDF(
     numOfSents: Long ) = 
 {
   val computeIDF = udf { df: Long =>
-    math.log((numOfSents.toDouble + 1) / (df.toDouble + 1))
+    math.abs(math.log((numOfSents.toDouble + 2) / (df.toDouble + 1)))
   }
   
   // Compute TF
@@ -122,10 +122,18 @@ def getSimilarities (TFIDFVectorsDF: DataFrame, magnitudesDF: DataFrame) : DataF
       val iMag = magnitudeArray(iSendId)
       val jMag = magnitudeArray(jSendId)
       var sum = 0.0
+      var iDist = 0.0
+      var jDist = 0.0
       for (index <- iVector.indices) {
-        if (index != 0) sum = sum + (iVector(index).asInstanceOf[Double] * jVector(index).asInstanceOf[Double])
+        if (index != 0) {
+          val i = iVector(index).asInstanceOf[Double]
+          val j = jVector(index).asInstanceOf[Double]
+          sum = sum + (i * j)
+          iDist = iDist + (i*i)
+          jDist = jDist + (j*j)
+        }
       }
-      val similarity = sum / (iMag * jMag)
+      val similarity = sum / (Math.sqrt(iDist) * Math.sqrt(jDist))
       result = result :+ ((iSendId.toString, jSendId.toString, similarity))
     }
   }
@@ -155,6 +163,7 @@ def getSimilarityMatrix(sents: Array[String], sentIds: Array[String]) : DataFram
   
   // Get the sparse TF-IDF matrix
   var pivotedTFIDFMatrixDF = TFIDFVectorsDF.groupBy("sent_id").pivot("word").sum("tf_idf").na.fill(0)
+  display(pivotedTFIDFMatrixDF)
   
   return getSimilarities(pivotedTFIDFMatrixDF, magnitudesDF)
 }
@@ -168,10 +177,39 @@ val result = rdd.collect().map(row => getSimilarityMatrix(row.getAs[Seq[String]]
 
 // COMMAND ----------
 
-// display(result(0))
-display(result(1))
-// display(result(2))
+// result(0).groupBy("sent_id_1").pivot("sent_id_2").sum("similarity").show()
+// result(1).groupBy("sent_id_1").pivot("sent_id_2").sum("similarity").show()
+// result(2).groupBy("sent_id_1").pivot("sent_id_2").sum("similarity").show()
+val newResDF = 
+result(1)
+.join(sentsMainDF, col("sent_id_1") === col("sent_id"))
+.select('sentence as "sentence_1", 'sent_id_2 as "sent_id_2" , 'similarity as "similarity")
+.join(sentsMainDF, col("sent_id_2") === col("sent_id"))
+.select('sentence_1 as "sentence_1", 'sentence as "sentence_2", 'similarity as "similarity")
+
+display(newResDF)
 
 // COMMAND ----------
 
-// 
+val predsDF = sparkSession.read
+.option("header", "true")
+.option("inderSchema", "true")
+.csv("dbfs:/FileStore/shared_uploads/sxs190008@utdallas.edu/dummy_data-3.csv")
+.toDF()
+
+// COMMAND ----------
+
+// doc_id
+// predited_summary
+// true_summary
+val rdd = predsDF.rdd
+val performances = rdd.collect()
+.map(row => (row(0), getSimilarityMatrix(Array(row(1).toString, "mama hjdfhj hkjhdf jigsaw"), Array("P", "T"))))
+
+// COMMAND ----------
+
+performances(1)._2.groupBy("sent_id_1").pivot("sent_id_2").sum("similarity").show()
+
+// COMMAND ----------
+
+
