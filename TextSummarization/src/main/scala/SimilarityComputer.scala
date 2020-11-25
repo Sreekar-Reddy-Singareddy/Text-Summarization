@@ -6,21 +6,25 @@ import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructT
 import org.apache.spark.sql.functions._
 import com.johnsnowlabs.nlp.{DocumentAssembler, SparkNLP}
 import com.johnsnowlabs.nlp.annotators.sbd.pragmatic.SentenceDetector
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.Pipeline
 
 import scala.collection.mutable.ListBuffer
 import scala.collection.mutable.WrappedArray
 import org.apache.spark.ml.feature.{RegexTokenizer, StopWordsRemover}
 
-class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = null, var sentencesDF: DataFrame, var resetProb:Double = 0.15, var iterations: Int)
+class SimilarityComputer ( var sparkSession: SparkSession,
+                           var sentencesDF: DataFrame,
+                           var resetProb:Double = 0.15,
+                           var iterations: Int
+                         ) extends Serializable
 {
-  private object testImplicits extends SQLImplicits {
+  object testImplicits extends SQLImplicits with Serializable {
     protected override def _sqlContext: SQLContext = sparkSession.sqlContext
   }
   import testImplicits._
 
   def summarize(aggrDF: DataFrame): DataFrame = {
-    sc = sparkSession.sparkContext
     val rdd = aggrDF.rdd
 
     val predictionsArr = rdd
@@ -32,7 +36,7 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
           row.getAs[Seq[String]]("sent_ids").toArray)
       ))
 
-    val predictionsDF = sc.parallelize(predictionsArr)
+    val predictionsDF = sparkSession.sparkContext.parallelize(predictionsArr)
       .toDF("doc_id", "predicted_summary")
 
     return predictionsDF
@@ -40,7 +44,7 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
   }
 
   def evaluate (predDF: DataFrame): DataFrame = {
-    sc = sparkSession.sparkContext
+    val sc = sparkSession.sparkContext
     val rdd = predDF.rdd
     val performances = rdd
       .collect()
@@ -119,6 +123,7 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
   }
 
   def getSimilarities (TFIDFVectorsDF: DataFrame) : DataFrame = {
+    val sc = sparkSession.sparkContext
     var result = new ListBuffer[(String, String, Double)]
     val tfidfVectorsArray = TFIDFVectorsDF.rdd
       .map(row => row.toSeq.toArray)
@@ -152,6 +157,7 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
   }
 
   def getSimilarityMatrix(sents: Array[String], sentIds: Array[String]) : DataFrame = {
+    val sc = sparkSession.sparkContext
     val transposed = Array(sentIds, sents).transpose
     var sentsDF = sc.parallelize(transposed)
       .map(x => (x(0), x(1)))
@@ -164,7 +170,13 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
     return getSimilarities(pivotedTFIDFMatrixDF)
   }
 
+  def getRank(Id:String, TR:  Broadcast[Map[String, Double]]):Double = {
+    var ret= TR.value.get(Id).getOrElse(Double).asInstanceOf[Double]
+    return ret
+  }
+
   def summarizeDocument (sents: Array[String], sentIds: Array[String]) : String = {
+    val sc = sparkSession.sparkContext
     // Step 1: Create a data frame for the sentences in this document
     val transposed = Array(sentIds, sents).transpose
     var sentsDF = sc.parallelize(transposed)
@@ -181,65 +193,76 @@ class SimilarityComputer(var sparkSession: SparkSession, var sc: SparkContext = 
   }
 
   def textRankAlgorithm (inputDF: DataFrame) : String = {
+    val sc = sparkSession.sparkContext
     var TextRanks = Map[String,Double]()
-    val totalNodes=sc.broadcast(inputDF.select($"sent_id_1").distinct().count())
+    val totalNodes = sc.broadcast(inputDF.select($"sent_id_1").distinct().count())
 
     val sList= inputDF.select($"sent_id_1").distinct().rdd.map(R=>R.get(0)).collect().toList
     sList.foreach(s=>TextRanks.put(s.asInstanceOf[String],1/totalNodes.value.toDouble))
 
-    var TR=sc.broadcast(TextRanks)
+    var TR = sc.broadcast(TextRanks)
 
-    var TextOutWeights=inputDF.groupBy("sent_id_1").sum("similarity").withColumnRenamed("sum(similarity)","sumOutWeights")
-    var StagingTable=inputDF.join(TextOutWeights,Seq("sent_id_1"))
+    var TextOutWeights = inputDF
+      .groupBy("sent_id_1")
+      .sum("similarity")
+      .withColumnRenamed("sum(similarity)","sumOutWeights")
+    var StagingTable = inputDF
+      .join(TextOutWeights, Seq("sent_id_1"))
       .withColumn("Weight",($"similarity"/$"sumOutWeights"))
 
-    def getRank(Id:String):Double = {
-      var ret= TR.value.get(Id).getOrElse(Double).asInstanceOf[Double]
-      return ret
-    }
-
-    var StagingTableRDD=StagingTable.rdd.map(L=>(L.getAs[String]("sent_id_2"),(L.getAs[String]("sent_id_1"),
-      L.getAs[Double]("Weight"))))
+    var StagingTableRDD = StagingTable.rdd
+      .map(L => (
+        L.getAs[String]("sent_id_2"),
+        (L.getAs[String]("sent_id_1"), L.getAs[Double]("Weight"))))
     StagingTableRDD.persist()
 
-    var StgRDD2=StagingTableRDD.map{case(x,(y,z))=>(x,getRank(y)*z)}.reduceByKey((a,b)=>a+b)
-      .map{case(x,y)=>(x,y*(1-resetProb)+resetProb)}
-
+    var StgRDD2 = StagingTableRDD
+      .map{case(x,(y,z)) => (x,getRank(y, TR)*z)}
+      .reduceByKey((a,b) => a+b)
+      .map{case(x,y) => (x,y*(1-resetProb)+resetProb)}
 
     TextRanks= collection.mutable.Map()++ StgRDD2.collect().toMap
-    TR=sc.broadcast(TextRanks);
+    TR = sc.broadcast(TextRanks);
 
     while(iterations>0){
-      StgRDD2=StagingTableRDD.map{case(x,(y,z))=>(x,getRank(y)*z)}.reduceByKey((a,b)=>a+b)
-        .map{case(x,y)=>(x,y*(1-resetProb)+resetProb)}
+      StgRDD2 = StagingTableRDD
+        .map{case(x,(y,z)) => (x,getRank(y, TR)*z)}
+        .reduceByKey((a,b) => a+b)
+        .map{case(x,y) => (x,y*(1-resetProb)+resetProb)}
 
-      TextRanks= collection.mutable.Map()++ StgRDD2.collect().toMap
-      TR=sc.broadcast(TextRanks);
-      iterations-=1
+      TextRanks = collection.mutable.Map()++ StgRDD2.collect().toMap
+      TR = sc.broadcast(TextRanks);
+      iterations -= 1
     }
 
-    println("\n\n Final Text Ranks:")
-    println(TR.value)
-    var topSentences=TR.value.toSeq.sortBy(-_._2).map(t=>t._1)
-    var returnSize=(totalNodes.value.toDouble * 0.5).round.asInstanceOf[Int]
-    println("summarySize: "+returnSize)
-    val finalSummarySentenceIds=topSentences.toList.take(returnSize)
-    println("\n\nOrdered in desc: "+finalSummarySentenceIds)
+    var topSentences = TR.value
+      .toSeq
+      .sortBy(-_._2)
+      .map(t=>t._1)
 
+    var returnSize = (totalNodes.value.toDouble * 0.5).round.asInstanceOf[Int]
+    val finalSummarySentenceIds = topSentences.toList.take(returnSize)
 
-    // TODO: Subhajit's logic goes here
-//    if (similarityMatrixDF.count() == 0) return "No summary!"
-//
-//    val someSentID = similarityMatrixDF
-//      .orderBy(desc("similarity"))
-//      .first()
-//      .getString(0)
-//
-//    val someSentence = sentencesDF
-//      .filter(col("sent_id") === someSentID)
-//      .first()
-//      .getString(1)
+    val sentIDsDF = sc
+      .parallelize(finalSummarySentenceIds)
+      .toDF("sent_id")
 
-    return "someSentence"
+    val df1 = sentIDsDF.as("T1")
+    val df2 = sentencesDF.as("T2")
+    val joinedDF = df1.join(df2, col("T1.sent_id") === col("T2.sent_id"))
+      .select("sentence")
+
+    var summary :String = ""
+    try {
+      summary = joinedDF.rdd
+        .map(row => row(0).asInstanceOf[String])
+        .reduce((x,y) => x+". "+y)
+    }
+    catch {
+      case e: Exception => summary = "N/A"
+    }
+
+    printf("Total Sents: %d, Returning: %d sentences, Final Summary: <<%s>>\n", totalNodes.value, returnSize, summary)
+    return summary
   }
 }

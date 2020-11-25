@@ -43,7 +43,7 @@ object BD_Project {
     val aggrDF = sentenceDF
       .groupBy("doc_id")
       .agg(collect_list("sentence") as "sentences", collect_list("sent_id") as "sent_ids")
-    val similarityComputer = new SimilarityComputer(sparkSession = sparkSession, sc=sparkSession.sparkContext, sentencesDF = sentenceDF, resetProb = 0.2, iterations = 5)
+    val similarityComputer = new SimilarityComputer(sparkSession = sparkSession, sentencesDF = sentenceDF, resetProb = 0.2, iterations = 5)
     val predictionsDF = similarityComputer.summarize(aggrDF)
     predictionsDF.show()
 
