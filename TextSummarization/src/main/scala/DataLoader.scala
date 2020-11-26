@@ -13,9 +13,9 @@ import scala.collection.mutable.ListBuffer
 import scala.collection.mutable.WrappedArray
 import org.apache.spark.ml.feature.{RegexTokenizer, StopWordsRemover}
 
-class DataLoader {
+object DataLoader {
 
-  def loadRawData(inputFilePath: String, sparkSession: SparkSession) :DataFrame = {
+  def loadRawData(inputFilePath: String, sparkSession: SparkSession, recordsSize: Int) :DataFrame = {
     val mainDF = sparkSession.read
       .option("header", "true")
       .option("multiLine", "true")
@@ -23,7 +23,11 @@ class DataLoader {
       .option("delimiter", ",")
       .option("inferSchema", "true")
       .csv(inputFilePath)
-      .toDF("text", "headline", "title")
+      .toDF("headline", "title", "text")
+      .select(col("*"), lower(col("text")))
+      .drop("text")
+      .withColumnRenamed("lower(text)", "text")
+      .limit(recordsSize)
 
     return mainDF
   }

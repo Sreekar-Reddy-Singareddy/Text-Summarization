@@ -26,6 +26,7 @@ class SimilarityComputer ( var sparkSession: SparkSession,
 
   def summarize(aggrDF: DataFrame): DataFrame = {
     val rdd = aggrDF.rdd
+    rdd.persist()
 
     val predictionsArr = rdd
       .collect()
@@ -36,8 +37,11 @@ class SimilarityComputer ( var sparkSession: SparkSession,
           row.getAs[Seq[String]]("sent_ids").toArray)
       ))
 
+//    val predictionsDF = sparkSession.sparkContext.parallelize(predictionsArr)
+//      .toDF("doc_id", "predicted_summary")
+
     val predictionsDF = sparkSession.sparkContext.parallelize(predictionsArr)
-      .toDF("doc_id", "predicted_summary")
+      .toDF("doc_id", "predicted_sent_ids")
 
     return predictionsDF
 
@@ -46,6 +50,8 @@ class SimilarityComputer ( var sparkSession: SparkSession,
   def evaluate (predDF: DataFrame): DataFrame = {
     val sc = sparkSession.sparkContext
     val rdd = predDF.rdd
+    rdd.persist()
+
     val performances = rdd
       .collect()
       .map(row => (
@@ -71,7 +77,7 @@ class SimilarityComputer ( var sparkSession: SparkSession,
     return similarity
   }
 
-  def calculateTFIDF(flattenedKeywordsDF: DataFrame,wordFreqInSentsDF: DataFrame,wordCol: String,sentIdCol: String,numOfSents: Long ): DataFrame = {
+  def calculateTFIDF(flattenedKeywordsDF: DataFrame, wordFreqInSentsDF: DataFrame,wordCol: String,sentIdCol: String,numOfSents: Long ): DataFrame = {
     val computeIDF = udf { df: Long =>
       math.abs(math.log((numOfSents.toDouble + 2) / (df.toDouble + 1)))
     }
@@ -175,24 +181,18 @@ class SimilarityComputer ( var sparkSession: SparkSession,
     return ret
   }
 
-  def summarizeDocument (sents: Array[String], sentIds: Array[String]) : String = {
+  def summarizeDocument (sents: Array[String], sentIds: Array[String]) : List[String] = {
     val sc = sparkSession.sparkContext
-    // Step 1: Create a data frame for the sentences in this document
-    val transposed = Array(sentIds, sents).transpose
-    var sentsDF = sc.parallelize(transposed)
-      .map(x => (x(0), x(1)))
-      .toDF("sent_id", "sentences")
+    // Step 1: Compute the similarity matrix for this document's sentences
+    val similarityDF = getSimilarityMatrix(sents, sentIds)
 
-    // Step 2: Compute the similarity matrix for this document's sentences
-    val inputDF = getSimilarityMatrix(sents, sentIds)
-
-    // Step 3: Using this matrix, compute the text ranks and get the final summary
-    val summaryForDocument = textRankAlgorithm(inputDF)
+    // Step 2: Using this matrix, compute the text ranks and get the final summary
+    val summaryForDocument = textRankAlgorithm(similarityDF)
 
     return summaryForDocument
   }
 
-  def textRankAlgorithm (inputDF: DataFrame) : String = {
+  def textRankAlgorithm (inputDF: DataFrame) : List[String] = {
     val sc = sparkSession.sparkContext
     var TextRanks = Map[String,Double]()
     val totalNodes = sc.broadcast(inputDF.select($"sent_id_1").distinct().count())
@@ -240,29 +240,10 @@ class SimilarityComputer ( var sparkSession: SparkSession,
       .sortBy(-_._2)
       .map(t=>t._1)
 
-    var returnSize = (totalNodes.value.toDouble * 0.5).round.asInstanceOf[Int]
+    var returnSize = (totalNodes.value.toDouble * 0.5).round.asInstanceOf[Int] + 1
     val finalSummarySentenceIds = topSentences.toList.take(returnSize)
 
-    val sentIDsDF = sc
-      .parallelize(finalSummarySentenceIds)
-      .toDF("sent_id")
-
-    val df1 = sentIDsDF.as("T1")
-    val df2 = sentencesDF.as("T2")
-    val joinedDF = df1.join(df2, col("T1.sent_id") === col("T2.sent_id"))
-      .select("sentence")
-
-    var summary :String = ""
-    try {
-      summary = joinedDF.rdd
-        .map(row => row(0).asInstanceOf[String])
-        .reduce((x,y) => x+". "+y)
-    }
-    catch {
-      case e: Exception => summary = "N/A"
-    }
-
-    printf("Total Sents: %d, Returning: %d sentences, Final Summary: <<%s>>\n", totalNodes.value, returnSize, summary)
-    return summary
+//    printf("Top Sentences: %s\n\n",finalSummarySentenceIds)
+    return finalSummarySentenceIds
   }
 }
